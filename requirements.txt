@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+apify-client
+pandas
+pydantic
+python-multipart
