@@ -62,11 +62,11 @@ class ExportRequest(BaseModel):
 @app.post("/api/search", response_model=List[InfluencerProfile])
 async def search_influencers(request: SearchRequest):
     """
-    Given a list of Instagram usernames, fetches their latest posts using Apify.
-    Calculates average likes, comments, and engagement rate based on those posts.
+    Given a list of Instagram usernames, fetches their profile details and posts using Apify.
+    Uses two calls: one for profile details (followers, bio) and one for posts (engagement).
     """
     if not APIFY_API_TOKEN or APIFY_API_TOKEN == "YOUR_APIFY_API_TOKEN_HERE":
-        raise HTTPException(status_code=500, detail="Apify API Token is missing. Please set it in backend/main.py")
+        raise HTTPException(status_code=500, detail="Apify API Token is missing.")
 
     if not request.usernames:
         raise HTTPException(status_code=400, detail="Please provide at least one username.")
@@ -74,65 +74,71 @@ async def search_influencers(request: SearchRequest):
     try:
         results = []
         for username in request.usernames:
-            # Prepare the Actor input exactly as the user specified, swapping out the URL
-            run_input = {
-                "directUrls": [f"https://www.instagram.com/{username}/"],
+            profile_url = f"https://www.instagram.com/{username}/"
+
+            # --- Call 1: Get profile details (followers, bio, verified status) ---
+            print(f"Fetching profile details for: {username}")
+            details_run = apify_client.actor(APIFY_ACTOR_ID).call(run_input={
+                "directUrls": [profile_url],
+                "resultsType": "details",
+                "resultsLimit": 1,
+                "addParentData": False,
+            })
+            profile_data = {}
+            for item in apify_client.dataset(details_run["defaultDatasetId"]).iterate_items():
+                profile_data = item
+                break  # We only need the first (and only) result
+
+            followers = profile_data.get("followersCount", 0)
+            following = profile_data.get("followingCount", 0)
+            posts_count = profile_data.get("postsCount", 0)
+            full_name = profile_data.get("fullName", username)
+            biography = profile_data.get("biography", "")
+            profile_pic = profile_data.get("profilePicUrlHD") or profile_data.get("profilePicUrl", "")
+            is_verified = profile_data.get("verified", False)
+
+            # --- Call 2: Get latest posts (for engagement metrics) ---
+            print(f"Fetching posts for: {username}")
+            posts_run = apify_client.actor(APIFY_ACTOR_ID).call(run_input={
+                "directUrls": [profile_url],
                 "resultsType": "posts",
                 "resultsLimit": 30,
                 "addParentData": False,
-            }
-
-            # Run the Actor and wait for it to finish
-            print(f"Triggering Apify task for: {username}")
-            run = apify_client.actor(APIFY_ACTOR_ID).call(run_input=run_input)
-            
-            # Since this actor returns a list of *posts*, we need to aggregate them
+            })
             posts = []
-            for item in apify_client.dataset(run["defaultDatasetId"]).iterate_items():
+            for item in apify_client.dataset(posts_run["defaultDatasetId"]).iterate_items():
                 posts.append(item)
 
-            if not posts:
-                 continue # Skip if nothing was found
-
-            # The actor returns post objects. We'll extract owner info from the first post
-            first_post = posts[0]
-            owner = first_post.get("ownerProfile", first_post.get("owner", {}))
-            
-            followers = first_post.get("ownerProfile", {}).get("followersCount", 0)
-            
             total_likes = 0
             total_comments = 0
-            post_count_for_avg = len(posts)
             post_urls = []
-
             for post in posts:
                 total_likes += post.get("likesCount", 0)
                 total_comments += post.get("commentsCount", 0)
                 if post.get("url"):
                     post_urls.append(post.get("url"))
-            
+
+            post_count_for_avg = len(posts)
             avg_likes = (total_likes // post_count_for_avg) if post_count_for_avg > 0 else 0
             avg_comments = (total_comments // post_count_for_avg) if post_count_for_avg > 0 else 0
-            
+
             engagement_rate = 0.0
             if followers > 0:
-                # Engagement rate formula = (Avg Likes + Avg Comments) / Followers * 100
-                engagement_rate = ((avg_likes + avg_comments) / followers) * 100
-                engagement_rate = round(engagement_rate, 2)
+                engagement_rate = round(((avg_likes + avg_comments) / followers) * 100, 2)
 
             profile = InfluencerProfile(
                 username=username,
-                full_name=first_post.get("ownerFullName", username),
-                biography="Biography not provided by this scraper type.",
+                full_name=full_name,
+                biography=biography,
                 followers_count=followers,
-                following_count=0, # Not provided by this scraper type
-                posts_count=first_post.get("ownerProfile", {}).get("postsCount", 0),
-                profile_pic_url=first_post.get("ownerProfile", {}).get("profilePicUrlHD") or first_post.get("ownerProfile", {}).get("profilePicUrl"),
-                is_verified=first_post.get("ownerProfile", {}).get("isVerified", False),
+                following_count=following,
+                posts_count=posts_count,
+                profile_pic_url=profile_pic,
+                is_verified=is_verified,
                 average_likes=avg_likes,
                 average_comments=avg_comments,
                 engagement_rate=engagement_rate,
-                latest_posts_urls=post_urls[:3] # keep only top 3
+                latest_posts_urls=post_urls[:3]
             )
             results.append(profile)
 
@@ -140,7 +146,7 @@ async def search_influencers(request: SearchRequest):
 
     except Exception as e:
         print(f"Error calling Apify: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch data from Apify via Actor {APIFY_ACTOR_ID}. Ensure your API key is correct. Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 @app.post("/api/export")
 async def export_to_csv(request: ExportRequest):
